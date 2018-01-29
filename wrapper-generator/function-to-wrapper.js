@@ -119,12 +119,22 @@ function createMemberFunction(obj, jsClassName, fn, params, typeCheckString, cas
 
     let returnString = returnValues.map(a => '    ' + a).join('\n');
 
-    let out = `${typeCheckString}
+    let out = `    if (args_count != ${params.length - 1}) {
+        const char* error_msg = "ERROR: wrong argument count for ${jsClassName}.${fn.name}, expected ${params.length - 1}.";
+        return jerry_create_error(JERRY_ERROR_TYPE, reinterpret_cast<const jerry_char_t*>(error_msg));
+    }
+    ${typeCheckString}
 
-    uintptr_t ptr_val;
-    jerry_get_object_native_handle(this_obj, &ptr_val);
+    void* void_ptr;
+    const jerry_object_native_info_t* type_ptr;
+    bool has_ptr = jerry_get_object_native_pointer(this_val, &void_ptr, &type_ptr);
 
-    ${obj.name}* native_ptr = reinterpret_cast<${obj.name}*>(ptr_val);
+    if (!has_ptr || type_ptr != &native_obj_type_info) {
+        return jerry_create_error(JERRY_ERROR_TYPE,
+                                  (const jerry_char_t *) "Failed to get native ${obj.name} pointer");
+    }
+
+    ${obj.name}* native_ptr = static_cast<${obj.name}*>(void_ptr);
 
 ${castString}
 
@@ -138,9 +148,13 @@ function createDestructor(obj, jsClassName) {
  *
  * Called if/when the ${jsClassName} is GC'ed.
  */
-void NAME_FOR_CLASS_NATIVE_DESTRUCTOR(${jsClassName})(const uintptr_t native_handle) {
-    delete reinterpret_cast<${obj.name}*>(native_handle);
-}`;
+void ${jsClassName}_Destructor(void* void_ptr) {
+    delete static_cast<${obj.name}*>(void_ptr);
+}
+
+static const jerry_object_native_info_t native_obj_type_info = {
+    .free_cb = ${jsClassName}_Destructor
+};`;
 }
 
 function createNativeWrapper(obj, jsClassName, allFns) {
@@ -151,18 +165,23 @@ function createNativeWrapper(obj, jsClassName, allFns) {
     }).map(p => {
         if (added.indexOf(p.name) !== -1) return null;
         added.push(p.name);
-        return `    ATTACH_CLASS_FUNCTION(js_object, ${jsClassName}, ${p.name});`;
+        return `    jerry_value_t ${p.name}_prop = jerry_create_string((const jerry_char_t*)("${p.name}"));
+    jerry_value_t ${p.name}_func = jerry_create_external_function(${p.name});
+    jerry_value_t ${p.name}_ret = jerry_set_property(js_object, ${p.name}_prop, ${p.name}_func);
+    jerry_release_value(${p.name}_prop);
+    jerry_release_value(${p.name}_func);
+    jerry_release_value(${p.name}_ret);
+`;
     }).filter(f => !!f).join('\n');
 
     let out = `
 /**
  * mbed_js_wrap_native_object (turns a native ${obj.name} object into a JS object)
  */
-jerry_value_t mbed_js_wrap_native_object(${obj.name}* ptr) {
-    uintptr_t native_ptr = (uintptr_t) ptr;
+jerry_value_t Create_Js_${jsClassName}(${obj.name}* native_ptr) {
 
     jerry_value_t js_object = jerry_create_object();
-    jerry_set_object_native_handle(js_object, native_ptr, NAME_FOR_CLASS_NATIVE_DESTRUCTOR(${jsClassName}));
+    jerry_set_object_native_pointer(js_object, native_ptr, &native_obj_type_info);
 
 ${fnString}
 
@@ -173,14 +192,18 @@ ${fnString}
 }
 
 function createConstructor(obj, jsClassName, fn, params, typeCheckString, castString, argString, allFns) {
-    return `${typeCheckString}
+    return `    if (args_count != ${params.length - 1}) {
+        const char* error_msg = "ERROR: wrong argument count for ${jsClassName}.__constructor, expected ${params.length - 1}.";
+        return jerry_create_error(JERRY_ERROR_TYPE, reinterpret_cast<const jerry_char_t*>(error_msg));
+    }
+${typeCheckString}
 
 ${castString}
 
     // Create the native object
     ${obj.name}* native_obj = new ${obj.name}(${argString});
 
-    return mbed_js_wrap_native_object(native_obj);`;
+    return Create_Js_${jsClassName}(native_obj);`;
 
     return out;
 }
@@ -267,13 +290,19 @@ function fnToString(obj, jsClassName, fn, allFns) {
                 case 'short int':
                 case 'long unsigned int':
                 case 'short unsigned int':
-                    checkArgumentTypes.push(`CHECK_ARGUMENT_TYPE_ON_CONDITION(${jsClassName}, ${fn.name}, ${ix-1}, number, (args_count == ${params.length - 1}));`);
-                    casting.push(`double jArg${ix-1} = jerry_get_number_value(args[${ix-1}]);`);
+                    checkArgumentTypes.push(`if (!jerry_value_is_number (args_p[${ix-1}])) {
+        const char* error_msg = "ERROR: wrong argument type for ${jsClassName}.${fn.name}, expected argument ${ix} to be a number.";
+        return jerry_create_error(JERRY_ERROR_TYPE, reinterpret_cast<const jerry_char_t*>(error_msg));
+    }`);
+                    casting.push(`double jArg${ix-1} = jerry_get_number_value(args_p[${ix-1}]);`);
                     casting.push(`${cppType} arg${ix-1} = static_cast<${cppType}>(jArg${ix-1});`);
                     break;
                 case 'bool':
-                    checkArgumentTypes.push(`CHECK_ARGUMENT_TYPE_ON_CONDITION(${jsClassName}, ${fn.name}, ${ix-1}, boolean, (args_count == ${params.length - 1}));`);
-                    casting.push(`bool arg${ix-1} = jerry_get_boolean_value(args[${ix-1}]);`);
+                    checkArgumentTypes.push(`if (!jerry_value_is_boolean (args_p[${ix-1}])) {
+        const char* error_msg = "ERROR: wrong argument type for ${jsClassName}.${fn.name}, expected argument ${ix} to be a boolean.";
+        return jerry_create_error(JERRY_ERROR_TYPE, reinterpret_cast<const jerry_char_t*>(error_msg));
+    }`);
+                    casting.push(`bool arg${ix-1} = jerry_get_boolean_value(args_p[${ix-1}]);`);
                     break;
                 default:
                     console.warn('Unknown fnparam base_type', type.name, type);
@@ -282,8 +311,11 @@ function fnToString(obj, jsClassName, fn, allFns) {
         }
 
         function handleEnumerationType(type) {
-            checkArgumentTypes.push(`CHECK_ARGUMENT_TYPE_ON_CONDITION(${jsClassName}, ${fn.name}, ${ix-1}, number, (args_count == ${params.length - 1}));`);
-            casting.push(`${cppType} arg${ix-1} = ${cppType}(jerry_get_number_value(args[${ix-1}]));`);
+            checkArgumentTypes.push(`if (!jerry_value_is_number (args_p[${ix-1}])) {
+        const char* error_msg = "ERROR: wrong argument type for ${jsClassName}.${fn.name}, expected argument ${ix} to be a number.\n";
+        return jerry_create_error(JERRY_ERROR_TYPE, reinterpret_cast<const jerry_char_t*>(error_msg));
+    }`);
+            casting.push(`${cppType} arg${ix-1} = ${cppType}(jerry_get_number_value(args_p[${ix-1}]));`);
 
             // Prevent PinNames from showing up here...
             if (type.name) {
@@ -296,18 +328,24 @@ function fnToString(obj, jsClassName, fn, allFns) {
 
         function handleClassType(type) {
             if (type.name.indexOf('basic_string') === 0) {
-                checkArgumentTypes.push(`CHECK_ARGUMENT_TYPE_ON_CONDITION(${jsClassName}, ${fn.name}, ${ix-1}, string, (args_count == ${params.length - 1}));`);
+                checkArgumentTypes.push(`if (!jerry_value_is_string (args_p[${ix-1}])) {
+            const char* error_msg = "ERROR: wrong argument type for ${jsClassName}.${fn.name}, expected argument ${ix} to be a string.\n";
+            return jerry_create_error(JERRY_ERROR_TYPE, reinterpret_cast<const jerry_char_t*>(error_msg));
+        }`);
 
-                casting.push(`jerry_size_t szArg${ix-1} = jerry_get_string_size(args[${ix-1}]);`);
+                casting.push(`jerry_size_t szArg${ix-1} = jerry_get_string_size(args_p[${ix-1}]);`);
                 casting.push(`jerry_char_t *sArg${ix-1} = (jerry_char_t*) calloc(szArg${ix-1} + 1, sizeof(jerry_char_t));`);
-                casting.push(`jerry_string_to_char_buffer(args[${ix-1}], sArg${ix-1}, szArg${ix-1});`);
+                casting.push(`jerry_string_to_char_buffer(args_p[${ix-1}], sArg${ix-1}, szArg${ix-1});`);
                 casting.push(`string arg${ix-1}((const char*) sArg${ix-1});`);
             }
             else {
-                checkArgumentTypes.push(`CHECK_ARGUMENT_TYPE_ON_CONDITION(${jsClassName}, ${fn.name}, ${ix-1}, object, (args_count == ${params.length - 1}));`);
+                checkArgumentTypes.push(`if (!jerry_value_is_object (args_p[${ix-1}])) {
+            const char* error_msg = "ERROR: wrong argument type for ${jsClassName}.${fn.name}, expected argument ${ix} to be a object.\n";
+            return jerry_create_error(JERRY_ERROR_TYPE, reinterpret_cast<const jerry_char_t*>(error_msg));
+        }`);
 
                 casting.push(`uintptr_t arg${ix-1}_native_handle;`);
-                casting.push(`jerry_get_object_native_handle(args[${ix-1}], &arg${ix-1}_native_handle);`);
+                casting.push(`jerry_get_object_native_handle(args_p[${ix-1}], &arg${ix-1}_native_handle);`);
                 casting.push(`${cppType} arg${ix-1} = *((${cppType}*)arg${ix-1}_native_handle);`);
             }
         }
@@ -338,18 +376,24 @@ function fnToString(obj, jsClassName, fn, allFns) {
 
         function handlePointerType(type) {
             if (cppType === 'const char*') {
-                checkArgumentTypes.push(`CHECK_ARGUMENT_TYPE_ON_CONDITION(${jsClassName}, ${fn.name}, ${ix-1}, string, (args_count == ${params.length - 1}));`);
+                checkArgumentTypes.push(`if (!jerry_value_is_string (args_p[${ix-1}])) {
+            const char* error_msg = "ERROR: wrong argument type for ${jsClassName}.${fn.name}, expected argument ${ix} to be a string.\n";
+            return jerry_create_error(JERRY_ERROR_TYPE, reinterpret_cast<const jerry_char_t*>(error_msg));
+        }`);
 
-                casting.push(`jerry_size_t szArg${ix-1} = jerry_get_string_size(args[${ix-1}]);`);
+                casting.push(`jerry_size_t szArg${ix-1} = jerry_get_string_size(args_p[${ix-1}]);`);
                 casting.push(`jerry_char_t *sArg${ix-1} = (jerry_char_t*) calloc(szArg${ix-1} + 1, sizeof(jerry_char_t));`);
-                casting.push(`jerry_string_to_char_buffer(args[${ix-1}], sArg${ix-1}, szArg${ix-1});`);
+                casting.push(`jerry_string_to_char_buffer(args_p[${ix-1}], sArg${ix-1}, szArg${ix-1});`);
                 casting.push(`${cppType} arg${ix-1} = (${cppType}) sArg${ix-1};`);
             }
             else {
-                checkArgumentTypes.push(`CHECK_ARGUMENT_TYPE_ON_CONDITION(${jsClassName}, ${fn.name}, ${ix-1}, object, (args_count == ${params.length - 1}));`);
+                checkArgumentTypes.push(`if (!jerry_value_is_object (args_p[${ix-1}])) {
+            const char* error_msg = "ERROR: wrong argument type for ${jsClassName}.${fn.name}, expected argument ${ix} to be a object.\n";
+            return jerry_create_error(JERRY_ERROR_TYPE, reinterpret_cast<const jerry_char_t*>(error_msg));
+        }`);
 
                 casting.push(`uintptr_t arg${ix-1}_native_handle;`);
-                casting.push(`jerry_get_object_native_handle(args[${ix-1}], &arg${ix-1}_native_handle);`);
+                casting.push(`jerry_get_object_native_handle(args_p[${ix-1}], &arg${ix-1}_native_handle);`);
                 casting.push(`${cppType} arg${ix-1} = (${cppType})arg${ix-1}_native_handle;`);
             }
         }
@@ -394,7 +438,7 @@ function fnToString(obj, jsClassName, fn, allFns) {
         }
     }
 
-    let typeCheckString = checkArgumentTypes.map(a => '    ' + a).join('\n');
+    let typeCheckString = checkArgumentTypes.join('\n');
     let castString = casting.map(a => '    ' + a).join('\n');
     let argString = Array.apply(null, { length: params.length - 1 }).map((v, ix) => 'arg' + ix).join(', ');
 
